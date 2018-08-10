@@ -169,6 +169,7 @@ class NodeManager(object):
             nodes = self.startup_nodes
 
         for node in nodes:
+            r = None
             try:
                 r = self.get_redis_link(host=node["host"], port=node["port"], decode_responses=True)
                 cluster_slots = r.execute_command("cluster", "slots")
@@ -183,6 +184,9 @@ class NodeManager(object):
                     raise RedisClusterException("ERROR sending 'cluster slots' command to redis server: {0}".format(node))
             except Exception:
                 raise RedisClusterException("ERROR sending 'cluster slots' command to redis server: {0}".format(node))
+            finally:
+                if r is not None:
+                    r.connection_pool.disconnect()
 
             all_slots_covered = True
 
@@ -265,6 +269,7 @@ class NodeManager(object):
         nodes = nodes_cache or self.nodes
 
         def node_require_full_coverage(node):
+            r_node = None
             try:
                 r_node = self.get_redis_link(host=node["host"], port=node["port"], decode_responses=True)
                 return "yes" in r_node.config_get("cluster-require-full-coverage").values()
@@ -272,6 +277,9 @@ class NodeManager(object):
                 return False
             except Exception:
                 raise RedisClusterException("ERROR sending 'config get cluster-require-full-coverage' command to redis server: {0}".format(node))
+            finally:
+                if r_node is not None:
+                    r_node.connection_pool.disconnect()
 
         # at least one node should have cluster-require-full-coverage yes
         return any(node_require_full_coverage(node) for node in nodes.values())
