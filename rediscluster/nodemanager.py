@@ -10,7 +10,7 @@ from .exceptions import RedisClusterException
 # 3rd party imports
 from redis import StrictRedis
 from redis._compat import b, unicode, bytes, long, basestring
-from redis import ConnectionError, TimeoutError
+from redis import ConnectionError, TimeoutError, ResponseError
 
 
 class NodeManager(object):
@@ -154,10 +154,6 @@ class NodeManager(object):
     def initialize(self):
         """
         Init the slots cache by asking all startup nodes what the current cluster configuration is
-
-        TODO: Currently the last node will have the last say about how the configuration is setup.
-        Maybe it should stop to try after it have correctly covered all slots or when one node is reached
-        and it could execute CLUSTER SLOTS command.
         """
         nodes_cache = {}
         tmp_slots = {}
@@ -173,14 +169,24 @@ class NodeManager(object):
             nodes = self.startup_nodes
 
         for node in nodes:
+            r = None
             try:
                 r = self.get_redis_link(host=node["host"], port=node["port"], decode_responses=True)
                 cluster_slots = r.execute_command("cluster", "slots")
                 startup_nodes_reachable = True
             except (ConnectionError, TimeoutError):
                 continue
+            except ResponseError as e:
+                # Isn't a cluster connection, so it won't parse these exceptions automatically
+                if 'CLUSTERDOWN' in e.message or 'MASTERDOWN' in e.message:
+                    continue
+                else:
+                    raise RedisClusterException("ERROR sending 'cluster slots' command to redis server: {0}".format(node))
             except Exception:
                 raise RedisClusterException("ERROR sending 'cluster slots' command to redis server: {0}".format(node))
+            finally:
+                if r is not None:
+                    r.connection_pool.disconnect()
 
             all_slots_covered = True
 
@@ -263,6 +269,7 @@ class NodeManager(object):
         nodes = nodes_cache or self.nodes
 
         def node_require_full_coverage(node):
+            r_node = None
             try:
                 r_node = self.get_redis_link(host=node["host"], port=node["port"], decode_responses=True)
                 return "yes" in r_node.config_get("cluster-require-full-coverage").values()
@@ -270,6 +277,9 @@ class NodeManager(object):
                 return False
             except Exception:
                 raise RedisClusterException("ERROR sending 'config get cluster-require-full-coverage' command to redis server: {0}".format(node))
+            finally:
+                if r_node is not None:
+                    r_node.connection_pool.disconnect()
 
         # at least one node should have cluster-require-full-coverage yes
         return any(node_require_full_coverage(node) for node in nodes.values())
