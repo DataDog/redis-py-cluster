@@ -8,7 +8,9 @@ import time
 
 # rediscluster imports
 from .connection import (
-    ClusterConnectionPool, ClusterReadOnlyConnectionPool,
+    ClusterConnectionPool,
+    ClusterReadOnlyConnectionPool,
+    ClusterWithReadReplicasConnectionPool,
     SSLClusterConnection,
 )
 from .exceptions import (
@@ -70,6 +72,25 @@ class StrictRedisCluster(StrictRedis):
         ], 'slot-id'),
     )
 
+    # Not complete, but covers the major ones
+    # https://redis.io/commands
+    READ_COMMANDS = [
+        "BITPOS", "BITCOUNT",
+        "EXISTS",
+        "GEOHASH", "GEOPOS", "GEODIST", "GEORADIUS", "GEORADIUSBYMEMBER",
+        "GET", "GETBIT", "GETRANGE",
+        "HEXISTS", "HGET", "HGETALL", "HKEYS", "HLEN", "HMGET", "HSTRLEN", "HVALS",
+        "KEYS",
+        "LINDEX", "LLEN", "LRANGE",
+        "MGET",
+        "PTTL",
+        "RANDOMKEY",
+        "SCARD", "SDIFF", "SINTER", "SISMEMBER", "SMEMBERS", "SRANDMEMBER",
+        "STRLEN", "SUNION",
+        "TTL",
+        "ZCARD", "ZCOUNT", "ZRANGE", "ZSCORE"
+    ]
+
     RESULT_CALLBACKS = dict_merge(
         string_keys_to_dict([
             "ECHO", "CONFIG GET", "CONFIG SET", "SLOWLOG GET", "CLIENT KILL", "INFO",
@@ -130,7 +151,7 @@ class StrictRedisCluster(StrictRedis):
 
     def __init__(self, host=None, port=None, startup_nodes=None, max_connections=None, max_connections_per_node=False, init_slot_cache=True,
                  readonly_mode=False, reinitialize_steps=None, skip_full_coverage_check=False, nodemanager_follow_cluster=False,
-                 connection_class=None, request_ttl=16, conn_err_sleep_time=0.1,  **kwargs):
+                 connection_class=None, read_from_replicas=False, request_ttl=16, conn_err_sleep_time=0.1,  **kwargs):
         """
         :startup_nodes:
             List of nodes that initial bootstrapping can be done from
@@ -178,6 +199,8 @@ class StrictRedisCluster(StrictRedis):
 
             if readonly_mode:
                 connection_pool_cls = ClusterReadOnlyConnectionPool
+            elif read_from_replicas:
+                connection_pool_cls = ClusterWithReadReplicasConnectionPool
             else:
                 connection_pool_cls = ClusterConnectionPool
 
@@ -200,11 +223,12 @@ class StrictRedisCluster(StrictRedis):
         self.result_callbacks = self.__class__.RESULT_CALLBACKS.copy()
         self.response_callbacks = self.__class__.RESPONSE_CALLBACKS.copy()
         self.response_callbacks = dict_merge(self.response_callbacks, self.CLUSTER_COMMANDS_RESPONSE_CALLBACKS)
+        self.read_from_replicas = read_from_replicas
         self.request_ttl = request_ttl
         self.conn_err_sleep_time = conn_err_sleep_time
 
     @classmethod
-    def from_url(cls, url, db=None, skip_full_coverage_check=False, readonly_mode=False, **kwargs):
+    def from_url(cls, url, db=None, skip_full_coverage_check=False, readonly_mode=False, read_from_replicas=False, **kwargs):
         """
         Return a Redis client object configured from the given URL, which must
         use either `the ``redis://`` scheme
@@ -226,6 +250,8 @@ class StrictRedisCluster(StrictRedis):
         """
         if readonly_mode:
             connection_pool_cls = ClusterReadOnlyConnectionPool
+        elif read_from_replicas:
+            connection_pool_cls = ClusterWithReadReplicasConnectionPool
         else:
             connection_pool_cls = ClusterConnectionPool
 
@@ -292,6 +318,10 @@ class StrictRedisCluster(StrictRedis):
 
         key = args[1]
 
+        # OBJECT command uses a special keyword as first positional argument
+        if command == 'OBJECT':
+            key = args[2]
+
         return self.connection_pool.nodes.keyslot(key)
 
     def _merge_result(self, command, res, **kwargs):
@@ -344,6 +374,7 @@ class StrictRedisCluster(StrictRedis):
 
         redirect_addr = None
         asking = False
+        is_read_replica = False
 
         try_random_node = False
         slot = self._determine_slot(*args)
@@ -363,7 +394,8 @@ class StrictRedisCluster(StrictRedis):
                     # MOVED
                     node = self.connection_pool.get_master_node_by_slot(slot)
                 else:
-                    node = self.connection_pool.get_node_by_slot(slot)
+                    node = self.connection_pool.get_node_by_slot(slot, self.read_from_replicas and (command in self.READ_COMMANDS))
+                    is_read_replica = node['server_type'] == 'slave'
                 r = self.connection_pool.get_connection_by_node(node)
 
             try:
@@ -371,6 +403,12 @@ class StrictRedisCluster(StrictRedis):
                     r.send_command('ASKING')
                     self.parse_response(r, "ASKING", **kwargs)
                     asking = False
+                if is_read_replica:
+                    # Ask read replica to accept reads (see https://redis.io/commands/readonly)
+                    # TODO: do we need to handle errors from this response?
+                    r.send_command('READONLY')
+                    self.parse_response(r, 'READONLY', **kwargs)
+                    is_read_replica = False
 
                 r.send_command(*args)
                 return self.parse_response(r, command, **kwargs)
@@ -736,12 +774,30 @@ class StrictRedisCluster(StrictRedis):
         Rename key ``src`` to ``dst``
 
         Cluster impl:
-            This operation is no longer atomic because each key must be querried
-            then set in separate calls because they maybe will change cluster node
+            If the src and dsst keys is in the same slot then send a plain RENAME
+            command to that node to do the rename inside the server.
+
+            If the keys is in crossslots then use the client side implementation
+            as fallback method. In this case this operation is no longer atomic as
+            the key is dumped and posted back to the server through the client.
         """
         if src == dst:
             raise ResponseError("source and destination objects are the same")
 
+        #
+        # Optimization where if both keys is in the same slot then we can use the
+        # plain upstream rename method.
+        #
+        src_slot = self.connection_pool.nodes.keyslot(src)
+        dst_slot = self.connection_pool.nodes.keyslot(dst)
+
+        if src_slot == dst_slot:
+            return self.execute_command('RENAME', src, dst)
+
+        #
+        # To provide cross slot support we implement rename by doing the internal command
+        # redis server runs but in the client instead.
+        #
         data = self.dump(src)
 
         if data is None:
