@@ -43,7 +43,6 @@ class StrictRedisCluster(StrictRedis):
     If a command is implemented over the one in StrictRedis then it requires some changes compared to
     the regular implementation of the method.
     """
-    RedisClusterRequestTTL = 16
 
     NODES_FLAGS = dict_merge(
         string_keys_to_dict([
@@ -131,7 +130,7 @@ class StrictRedisCluster(StrictRedis):
 
     def __init__(self, host=None, port=None, startup_nodes=None, max_connections=None, max_connections_per_node=False, init_slot_cache=True,
                  readonly_mode=False, reinitialize_steps=None, skip_full_coverage_check=False, nodemanager_follow_cluster=False,
-                 connection_class=None, **kwargs):
+                 connection_class=None, request_ttl=16, conn_err_sleep_time=0.1,  **kwargs):
         """
         :startup_nodes:
             List of nodes that initial bootstrapping can be done from
@@ -150,6 +149,10 @@ class StrictRedisCluster(StrictRedis):
             The node manager will during initialization try the last set of nodes that
             it was operating on. This will allow the client to drift along side the cluster
             if the cluster nodes move around alot.
+        :request_ttl:
+            Number of allowed command tries before throwing ClusterError exception. Defaults to 16
+        :conn_err_sleep_time:
+            Time to sleep after a ConnectionError or TimeoutError. Defaults to 0.1 seconds
         :**kwargs:
             Extra arguments that will be sent into StrictRedis instance when created
             (See Official redis-py doc for supported kwargs
@@ -197,6 +200,8 @@ class StrictRedisCluster(StrictRedis):
         self.result_callbacks = self.__class__.RESULT_CALLBACKS.copy()
         self.response_callbacks = self.__class__.RESPONSE_CALLBACKS.copy()
         self.response_callbacks = dict_merge(self.response_callbacks, self.CLUSTER_COMMANDS_RESPONSE_CALLBACKS)
+        self.request_ttl = request_ttl
+        self.conn_err_sleep_time = conn_err_sleep_time
 
     @classmethod
     def from_url(cls, url, db=None, skip_full_coverage_check=False, readonly_mode=False, **kwargs):
@@ -342,7 +347,7 @@ class StrictRedisCluster(StrictRedis):
 
         try_random_node = False
         slot = self._determine_slot(*args)
-        ttl = int(self.RedisClusterRequestTTL)
+        ttl = int(self.request_ttl)
 
         while ttl > 0:
             ttl -= 1
@@ -374,8 +379,8 @@ class StrictRedisCluster(StrictRedis):
             except (ConnectionError, TimeoutError):
                 try_random_node = True
 
-                if ttl < self.RedisClusterRequestTTL / 2:
-                    time.sleep(0.1)
+                if ttl < self.request_ttl / 2:
+                    time.sleep(self.conn_err_sleep_time)
             except ClusterDownError as e:
                 self.connection_pool.disconnect()
                 self.connection_pool.reset()
@@ -393,7 +398,7 @@ class StrictRedisCluster(StrictRedis):
                 node = self.connection_pool.nodes.set_node(e.host, e.port, server_type='master')
                 self.connection_pool.nodes.slots[e.slot_id][0] = node
             except TryAgainError as e:
-                if ttl < self.RedisClusterRequestTTL / 2:
+                if ttl < self.request_ttl / 2:
                     time.sleep(0.05)
             except AskError as e:
                 redirect_addr, asking = "{0}:{1}".format(e.host, e.port), True
