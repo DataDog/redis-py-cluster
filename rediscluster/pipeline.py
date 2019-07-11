@@ -5,9 +5,7 @@ import sys
 
 # rediscluster imports
 from .client import StrictRedisCluster
-from .exceptions import (
-    RedisClusterException, AskError, MovedError, TryAgainError,
-)
+from .exceptions import RedisClusterException, AskError, MovedError, TryAgainError
 from .utils import clusterdown_wrapper, dict_merge
 
 # 3rd party imports
@@ -23,8 +21,15 @@ class StrictClusterPipeline(StrictRedisCluster):
     """
     """
 
-    def __init__(self, connection_pool, result_callbacks=None,
-                 response_callbacks=None, startup_nodes=None):
+    def __init__(
+        self,
+        connection_pool,
+        result_callbacks=None,
+        response_callbacks=None,
+        startup_nodes=None,
+        request_ttl=16,
+        conn_err_sleep_time=0.1,
+    ):
         """
         """
         self.command_stack = []
@@ -33,8 +38,11 @@ class StrictClusterPipeline(StrictRedisCluster):
         self.result_callbacks = result_callbacks or self.__class__.RESULT_CALLBACKS.copy()
         self.startup_nodes = startup_nodes if startup_nodes else []
         self.nodes_flags = self.__class__.NODES_FLAGS.copy()
-        self.response_callbacks = dict_merge(response_callbacks or self.__class__.RESPONSE_CALLBACKS.copy(),
-                                             self.CLUSTER_COMMANDS_RESPONSE_CALLBACKS)
+        self.response_callbacks = dict_merge(
+            response_callbacks or self.__class__.RESPONSE_CALLBACKS.copy(), self.CLUSTER_COMMANDS_RESPONSE_CALLBACKS
+        )
+        self.request_ttl = request_ttl
+        self.conn_err_sleep_time = conn_err_sleep_time
 
     def __repr__(self):
         """
@@ -84,9 +92,10 @@ class StrictClusterPipeline(StrictRedisCluster):
     def annotate_exception(self, exception, number, command):
         """
         """
-        cmd = unicode(' ').join(imap(unicode, command))
-        msg = unicode('Command # {0} ({1}) of pipeline caused error: {2}').format(
-            number, cmd, unicode(exception.args[0]))
+        cmd = unicode(" ").join(imap(unicode, command))
+        msg = unicode("Command # {0} ({1}) of pipeline caused error: {2}").format(
+            number, cmd, unicode(exception.args[0])
+        )
         exception.args = (msg,) + exception.args[1:]
 
     def execute(self, raise_on_error=True):
@@ -162,7 +171,7 @@ class StrictClusterPipeline(StrictRedisCluster):
 
             # now that we know the name of the node ( it's just a string in the form of host:port )
             # we can build a list of commands for each node.
-            node_name = node['name']
+            node_name = node["name"]
             if node_name not in nodes:
                 nodes[node_name] = NodeCommands(self.parse_response, self.connection_pool.get_connection_by_node(node))
 
@@ -281,15 +290,20 @@ class StrictClusterPipeline(StrictRedisCluster):
         if len(names) != 1:
             raise RedisClusterException("deleting multiple keys is not implemented in pipeline command")
 
-        return self.execute_command('DEL', names[0])
+        return self.execute_command("DEL", names[0])
 
 
 def block_pipeline_command(func):
     """
     Prints error because some pipelined commands should be blocked when running in cluster-mode
     """
+
     def inner(*args, **kwargs):
-        raise RedisClusterException("ERROR: Calling pipelined function {0} is blocked when running redis in cluster mode...".format(func.__name__))
+        raise RedisClusterException(
+            "ERROR: Calling pipelined function {0} is blocked when running redis in cluster mode...".format(
+                func.__name__
+            )
+        )
 
     return inner
 
@@ -335,7 +349,9 @@ StrictClusterPipeline.script_kill = block_pipeline_command(StrictRedis.script_ki
 StrictClusterPipeline.script_load = block_pipeline_command(StrictRedis.script_load)
 StrictClusterPipeline.sdiff = block_pipeline_command(StrictRedis.sdiff)
 StrictClusterPipeline.sdiffstore = block_pipeline_command(StrictRedis.sdiffstore)
-StrictClusterPipeline.sentinel_get_master_addr_by_name = block_pipeline_command(StrictRedis.sentinel_get_master_addr_by_name)
+StrictClusterPipeline.sentinel_get_master_addr_by_name = block_pipeline_command(
+    StrictRedis.sentinel_get_master_addr_by_name
+)
 StrictClusterPipeline.sentinel_master = block_pipeline_command(StrictRedis.sentinel_master)
 StrictClusterPipeline.sentinel_masters = block_pipeline_command(StrictRedis.sentinel_masters)
 StrictClusterPipeline.sentinel_monitor = block_pipeline_command(StrictRedis.sentinel_monitor)
