@@ -1,71 +1,76 @@
 # -*- coding: utf-8 -*-
 
 # python std lib
-from __future__ import with_statement
+from __future__ import unicode_literals
 import re
 
 # rediscluster imports
-from rediscluster.client import StrictRedisCluster
+from rediscluster.client import RedisCluster
 from rediscluster.connection import ClusterConnectionPool, ClusterReadOnlyConnectionPool
 from rediscluster.exceptions import RedisClusterException
-from tests.conftest import _get_client
+from tests.conftest import _get_client, skip_if_server_version_lt
 
 # 3rd party imports
 import pytest
 from mock import patch
-from redis._compat import b, u, unichr, unicode
+from redis._compat import unichr, unicode
 from redis.exceptions import WatchError, ResponseError, ConnectionError
 
 
 class TestPipeline(object):
     """
     """
+    def test_pipeline_is_true(self, r):
+        "Ensure pipeline instances are not false-y"
+        with r.pipeline() as pipe:
+            assert pipe
 
     def test_pipeline(self, r):
         with r.pipeline() as pipe:
-            pipe.set('a', 'a1').get('a').zadd('z', z1=1).zadd('z', z2=4)
-            pipe.zincrby('z', 'z1').zrange('z', 0, 5, withscores=True)
+            (pipe.set('a', 'a1')
+                 .get('a')
+                 .zadd('z', {'z1': 1})
+                 .zadd('z', {'z2': 4})
+                 .zincrby('z', 1, 'z1')
+                 .zrange('z', 0, 5, withscores=True))
             assert pipe.execute() == [
                 True,
-                b('a1'),
+                b'a1',
                 True,
                 True,
                 2.0,
-                [(b('z1'), 2.0), (b('z2'), 4)],
+                [(b'z1', 2.0), (b'z2', 4)],
             ]
 
     def test_pipeline_length(self, r):
         with r.pipeline() as pipe:
             # Initially empty.
             assert len(pipe) == 0
-            assert not pipe
 
             # Fill 'er up!
             pipe.set('a', 'a1').set('b', 'b1').set('c', 'c1')
             assert len(pipe) == 3
-            assert pipe
 
             # Execute calls reset(), so empty once again.
             pipe.execute()
             assert len(pipe) == 0
-            assert not pipe
 
     def test_pipeline_no_transaction(self, r):
         with r.pipeline(transaction=False) as pipe:
             pipe.set('a', 'a1').set('b', 'b1').set('c', 'c1')
             assert pipe.execute() == [True, True, True]
-            assert r['a'] == b('a1')
-            assert r['b'] == b('b1')
-            assert r['c'] == b('c1')
+            assert r['a'] == b'a1'
+            assert r['b'] == b'b1'
+            assert r['c'] == b'c1'
 
     def test_pipeline_eval(self, r):
         with r.pipeline(transaction=False) as pipe:
             pipe.eval("return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}", 2, "A{foo}", "B{foo}", "first", "second")
             res = pipe.execute()[0]
-            assert res[0] == b('A{foo}')
-            assert res[1] == b('B{foo}')
-            assert res[2] == b('first')
-            assert res[3] == b('second')
+            assert res[0] == b'A{foo}'
+            assert res[1] == b'B{foo}'
+            assert res[2] == b'first'
+            assert res[3] == b'second'
 
     @pytest.mark.xfail(reason="unsupported command: watch")
     def test_pipeline_no_transaction_watch(self, r):
@@ -95,7 +100,7 @@ class TestPipeline(object):
             with pytest.raises(WatchError):
                 pipe.execute()
 
-            assert r['a'] == b('bad')
+            assert r['a'] == b'bad'
 
     def test_exec_error_in_response(self, r):
         """
@@ -108,23 +113,23 @@ class TestPipeline(object):
             result = pipe.execute(raise_on_error=False)
 
             assert result[0]
-            assert r['a'] == b('1')
+            assert r['a'] == b'1'
             assert result[1]
-            assert r['b'] == b('2')
+            assert r['b'] == b'2'
 
             # we can't lpush to a key that's a string value, so this should
             # be a ResponseError exception
             assert isinstance(result[2], ResponseError)
-            assert r['c'] == b('a')
+            assert r['c'] == b'a'
 
             # since this isn't a transaction, the other commands after the
             # error are still executed
             assert result[3]
-            assert r['d'] == b('4')
+            assert r['d'] == b'4'
 
             # make sure the pipe was restored to a working state
             assert pipe.set('z', 'zzz').execute() == [True]
-            assert r['z'] == b('zzz')
+            assert r['z'] == b'zzz'
 
     def test_exec_error_raised(self, r):
         r['c'] = 'a'
@@ -137,7 +142,35 @@ class TestPipeline(object):
 
             # make sure the pipe was restored to a working state
             assert pipe.set('z', 'zzz').execute() == [True]
-            assert r['z'] == b('zzz')
+            assert r['z'] == b'zzz'
+
+    def test_transaction_with_empty_error_command(self, r):
+        """
+        Commands with custom EMPTY_ERROR functionality return their default
+        values in the pipeline no matter the raise_on_error preference
+        """
+        for error_switch in (True, False):
+            with r.pipeline() as pipe:
+                pipe.set('a', 1).get("").set('c', 3)
+                result = pipe.execute(raise_on_error=error_switch)
+
+                assert result[0]
+                assert result[1] == None
+                assert result[2]
+
+    def test_pipeline_with_empty_error_command(self, r):
+        """
+        Commands with custom EMPTY_ERROR functionality return their default
+        values in the pipeline no matter the raise_on_error preference
+        """
+        for error_switch in (True, False):
+            with r.pipeline(transaction=False) as pipe:
+                pipe.set('a', 1).get("").set('c', 3)
+                result = pipe.execute(raise_on_error=error_switch)
+
+                assert result[0]
+                assert result[1] == None
+                assert result[2]
 
     def test_parse_error_raised(self, r):
         with r.pipeline() as pipe:
@@ -151,7 +184,7 @@ class TestPipeline(object):
 
             # make sure the pipe was restored to a working state
             assert pipe.set('z', 'zzz').execute() == [True]
-            assert r['z'] == b('zzz')
+            assert r['z'] == b'zzz'
 
     @pytest.mark.xfail(reason="unsupported command: watch")
     def test_watch_succeed(self, r):
@@ -163,8 +196,8 @@ class TestPipeline(object):
             assert pipe.watching
             a_value = pipe.get('a')
             b_value = pipe.get('b')
-            assert a_value == b('1')
-            assert b_value == b('2')
+            assert a_value == b'1'
+            assert b_value == b'2'
             pipe.multi()
 
             pipe.set('c', 3)
@@ -187,6 +220,20 @@ class TestPipeline(object):
             assert not pipe.watching
 
     @pytest.mark.xfail(reason="unsupported command: watch")
+    def test_watch_failure_in_empty_transaction(self, r):
+        r['a'] = 1
+        r['b'] = 2
+
+        with r.pipeline() as pipe:
+            pipe.watch('a', 'b')
+            r['b'] = 3
+            pipe.multi()
+            with pytest.raises(redis.WatchError):
+                pipe.execute()
+
+            assert not pipe.watching
+
+    @pytest.mark.xfail(reason="unsupported command: watch")
     def test_unwatch(self, r):
         r['a'] = 1
         r['b'] = 2
@@ -197,7 +244,7 @@ class TestPipeline(object):
             pipe.unwatch()
             assert not pipe.watching
             pipe.get('a')
-            assert pipe.execute() == [b('1')]
+            assert pipe.execute() == [b'1']
 
     @pytest.mark.xfail(reason="unsupported command: watch")
     def test_transaction_callable(self, r):
@@ -207,9 +254,9 @@ class TestPipeline(object):
 
         def my_transaction(pipe):
             a_value = pipe.get('a')
-            assert a_value in (b('1'), b('2'))
+            assert a_value in (b'1', b'2')
             b_value = pipe.get('b')
-            assert b_value == b('2')
+            assert b_value == b'2'
 
             # silly run-once code... incr's "a" so WatchError should be raised
             # forcing this all to run again. this should incr "a" once to "2"
@@ -222,7 +269,16 @@ class TestPipeline(object):
 
         result = r.transaction(my_transaction, 'a', 'b')
         assert result == [True]
-        assert r['c'] == b('4')
+        assert r['c'] == b'4'
+
+    @pytest.mark.xfail(reason="unsupported command: watch")
+    def test_transaction_callable_returns_value_from_callable(self, r):
+        def callback(pipe):
+            # No need to do anything here since we only want the return value
+            return 'a'
+
+        res = r.transaction(callback, 'my-key', value_from_callable=True)
+        assert res == 'a'
 
     def test_exec_error_in_no_transaction_pipeline(self, r):
         r['a'] = 1
@@ -236,10 +292,10 @@ class TestPipeline(object):
             assert unicode(ex.value).startswith('Command # 1 (LLEN a) of '
                                                 'pipeline caused error: ')
 
-        assert r['a'] == b('1')
+        assert r['a'] == b'1'
 
     def test_exec_error_in_no_transaction_pipeline_unicode_command(self, r):
-        key = unichr(3456) + u('abcd') + unichr(3421)
+        key = unichr(3456) + u'abcd' + unichr(3421)
         r[key] = 1
         with r.pipeline(transaction=False) as pipe:
             pipe.llen(key)
@@ -251,7 +307,25 @@ class TestPipeline(object):
             expected = unicode('Command # 1 (LLEN {0}) of pipeline caused error: ').format(key)
             assert unicode(ex.value).startswith(expected)
 
-        assert r[key] == b('1')
+        assert r[key] == b'1'
+
+    @skip_if_server_version_lt('3.2.0')
+    def test_pipeline_with_bitfield(self, r):
+        with r.pipeline() as pipe:
+            pipe.set('a', '1')
+            bf = pipe.bitfield('b')
+            pipe2 = (bf
+                     .set('u8', 8, 255)
+                     .get('u8', 0)
+                     .get('u4', 8)  # 1111
+                     .get('u4', 12)  # 1111
+                     .get('u4', 13)  # 1110
+                     .execute())
+            pipe.get('a')
+            response = pipe.execute()
+
+            assert pipe == pipe2
+            assert response == [True, [0, 0, 15, 15, 14], b'1']
 
     def test_blocked_methods(self, r):
         """
@@ -303,7 +377,7 @@ class TestPipeline(object):
         """
         Test that we can use a pipeline with the RedisCluster class
         """
-        r = _get_client(cls=None)
+        r = _get_client(RedisCluster)
         with r.pipeline(transaction=False) as pipe:
             pipe.get("foobar")
 
@@ -492,14 +566,14 @@ class TestReadOnlyPipeline(object):
         On readonly mode, we supports get related stuff only.
         """
         r.set('foo71', 'a1')   # we assume this key is set on 127.0.0.1:7001
-        r.zadd('foo88', z1=1)  # we assume this key is set on 127.0.0.1:7002
-        r.zadd('foo88', z2=4)
+        r.zadd('foo88', {'z1': 1})  # we assume this key is set on 127.0.0.1:7002
+        r.zadd('foo88', {'z2': 4})
 
         with ro.pipeline() as readonly_pipe:
             readonly_pipe.get('foo71').zrange('foo88', 0, 5, withscores=True)
             assert readonly_pipe.execute() == [
-                b('a1'),
-                [(b('z1'), 1.0), (b('z2'), 4)],
+                b'a1',
+                [(b'z1', 1.0), (b'z2', 4)],
             ]
 
     def assert_moved_redirection_on_slave(self, connection_pool_cls, cluster_obj):
@@ -519,7 +593,6 @@ class TestReadOnlyPipeline(object):
                 with cluster_obj.pipeline() as pipe:
                     # we assume this key is set on 127.0.0.1:7001(7004)
                     pipe.get('foo87').get('foo88').execute() == [None, None]
-                    assert return_master_mock.call_count == 2
 
     def test_moved_redirection_on_slave_with_default(self):
         """
@@ -528,7 +601,7 @@ class TestReadOnlyPipeline(object):
         """
         self.assert_moved_redirection_on_slave(
             ClusterConnectionPool,
-            StrictRedisCluster(host="127.0.0.1", port=7000, reinitialize_steps=1)
+            RedisCluster(host="127.0.0.1", port=7000, reinitialize_steps=1)
         )
 
     def test_moved_redirection_on_slave_with_readonly_mode_client(self):
@@ -537,7 +610,7 @@ class TestReadOnlyPipeline(object):
         """
         self.assert_moved_redirection_on_slave(
             ClusterReadOnlyConnectionPool,
-            StrictRedisCluster(host="127.0.0.1", port=7000, readonly_mode=True, reinitialize_steps=1)
+            RedisCluster(host="127.0.0.1", port=7000, readonly_mode=True, reinitialize_steps=1)
         )
 
     def test_access_correct_slave_with_readonly_mode_client(self, sr):
@@ -565,7 +638,6 @@ class TestReadOnlyPipeline(object):
                     ClusterConnectionPool,
                     'get_master_node_by_slot',
                     return_value=master_value) as return_master_mock:
-                readonly_client = StrictRedisCluster(host="127.0.0.1", port=7000, readonly_mode=True)
+                readonly_client = RedisCluster(host="127.0.0.1", port=7000, readonly_mode=True)
                 with readonly_client.pipeline() as readonly_pipe:
-                    assert readonly_pipe.get('foo88').get('foo87').execute() == [b('bar'), b('foo')]
-                    assert return_master_mock.call_count == 0
+                    assert readonly_pipe.get('foo88').get('foo87').execute() == [b'bar', b'foo']

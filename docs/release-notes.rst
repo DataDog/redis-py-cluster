@@ -1,8 +1,40 @@
 Release Notes
 =============
 
+2.1.0 (xxx yy, 2020)
+
+    * Add new config option for Client and Pipeline classes to controll how many attempts will be made before bailing out from a ClusterDownError.
+      Use "cluster_down_retry_attempts=<int>" when creating the client class to controll this behaviour.
+    * Updated redis-py compatbile version to support any version in the major version 3.0.x, 3.1.x, 3.2.x, 3.3.x. (#326)
+    * Fixed bug preventing reinitialization after getting MOVED errors
+
+2.0.0 (Aug 12, 2019)
+
+Specific changes to redis-py-cluster is mentioned below here. 
+
+    * Update entire code base to now support all redis-py version in the 3.0.x version line. Any future redis-py version will be supported at a later time.
+    * Major update to all tests to mirror the code of the same tests from redis-py
+    * Dropped support for the 2.10.6 redis-py release.
+    * Add pythoncodestyle lint validation check to travis-ci runs to check for proper linting before accepting PR:s
+    * Class StrictRedisCluster was renamed to RedisCluster
+    * Class StrictRedis has been removed to mirror upstream class structure
+    * Class StrictClusterPipeline was renamed to ClusterPipeline
+    * Fixed travis-ci tests not running properly on python 3.7
+    * Fixed documentation regarding threads in pipelines
+    * Update lit of command callbacks and parsers. Added in "CLIENT ID"
+    * Removed custom implementation of SORT and revert back to use same-slot mechanism for that command.
+    * Added better exception message to get_master_node_by_slot command to help the user understand the error.
+    * Improved the exception object message parsing when running on python3
+
+
+1.3.6 (Nov 16, 2018)
+--------------------
+
+    * Pin upstream redis-py package to release 2.10.6 to avoid issues with incompatible version 3.0.0
+
+
 1.3.5 (July 22, 2018)
---------------
+---------------------
 
     * Add Redis 4 compatability fix to CLUSTER NODES command (See issue #217)
     * Fixed bug with command "CLUSTER GETKEYSINSLOT" that was throwing exceptions
