@@ -85,7 +85,6 @@ class RedisCluster(Redis):
     If a command is implemented over the one in Redis then it requires some changes compared to
     the regular implementation of the method.
     """
-    RedisClusterRequestTTL = 16
 
     NODES_FLAGS = dict_merge(
         string_keys_to_dict([
@@ -291,7 +290,8 @@ class RedisCluster(Redis):
 
     def __init__(self, host=None, port=None, startup_nodes=None, max_connections=None, max_connections_per_node=False, init_slot_cache=True,
                  readonly_mode=False, reinitialize_steps=None, skip_full_coverage_check=False, nodemanager_follow_cluster=False,
-                 connection_class=None, read_from_replicas=False, cluster_down_retry_attempts=3, **kwargs):
+                 connection_class=None, read_from_replicas=False, cluster_down_retry_attempts=3,
+                 request_ttl=16, conn_err_sleep_time=0.1, **kwargs):
         """
         :startup_nodes:
             List of nodes that initial bootstrapping can be done from
@@ -310,6 +310,10 @@ class RedisCluster(Redis):
             The node manager will during initialization try the last set of nodes that
             it was operating on. This will allow the client to drift along side the cluster
             if the cluster nodes move around alot.
+        :request_ttl:
+            Number of allowed command tries before throwing ClusterError exception. Defaults to 16
+        :conn_err_sleep_time:
+            Time to sleep after a ConnectionError or TimeoutError. Defaults to 0.1 seconds
         :**kwargs:
             Extra arguments that will be sent into Redis instance when created
             (See Official redis-py doc for supported kwargs
@@ -361,6 +365,8 @@ class RedisCluster(Redis):
         self.response_callbacks = CaseInsensitiveDict(dict_merge(self.response_callbacks, self.CLUSTER_COMMANDS_RESPONSE_CALLBACKS))
         self.read_from_replicas = read_from_replicas
         self.cluster_down_retry_attempts = cluster_down_retry_attempts
+        self.request_ttl = request_ttl
+        self.conn_err_sleep_time = conn_err_sleep_time
 
     @classmethod
     def from_url(cls, url, db=None, skip_full_coverage_check=False, readonly_mode=False, read_from_replicas=False, **kwargs):
@@ -394,7 +400,7 @@ class RedisCluster(Redis):
             connection_pool_cls = ClusterConnectionPool
 
         connection_pool = connection_pool_cls.from_url(url, db=db, skip_full_coverage_check=skip_full_coverage_check, **kwargs)
-        
+
         if connection_pool.connection_class == SSLConnection:
             connection_pool.connection_class = SSLClusterConnection
 
@@ -520,7 +526,7 @@ class RedisCluster(Redis):
 
         It will try the number of times specified by the config option "self.cluster_down_retry_attempts"
         which defaults to 3 unless manually configured.
-        
+
         If it reaches the number of times, the command will raises ClusterDownException.
         """
         for _ in range(0, self.cluster_down_retry_attempts):
@@ -558,7 +564,7 @@ class RedisCluster(Redis):
 
         try_random_node = False
         slot = self._determine_slot(*args)
-        ttl = int(self.RedisClusterRequestTTL)
+        ttl = int(self.request_ttl)
 
         while ttl > 0:
             ttl -= 1
@@ -599,8 +605,8 @@ class RedisCluster(Redis):
             except ConnectionError:
                 r.disconnect()
             except TimeoutError:
-                if ttl < self.RedisClusterRequestTTL / 2:
-                    time.sleep(0.05)
+                if ttl < (self.request_ttl or self.RedisClusterRequestTTL) / 2:
+                    time.sleep(self.conn_err_sleep_time)
                 else:
                     try_random_node = True
             except ClusterDownError as e:
@@ -620,7 +626,7 @@ class RedisCluster(Redis):
                 node = self.connection_pool.nodes.set_node(e.host, e.port, server_type='master')
                 self.connection_pool.nodes.slots[e.slot_id][0] = node
             except TryAgainError as e:
-                if ttl < self.RedisClusterRequestTTL / 2:
+                if ttl < self.request_ttl / 2:
                     time.sleep(0.05)
             except AskError as e:
                 redirect_addr, asking = "{0}:{1}".format(e.host, e.port), True
@@ -1294,3 +1300,91 @@ class RedisCluster(Redis):
 
 
 from rediscluster.pipeline import ClusterPipeline
+
+class RedisCluster(StrictRedisCluster):
+    """
+    Provides backwards compatibility with older versions of redis-py that
+    changed arguments to some commands to be more Pythonic, sane, or by
+    accident.
+    """
+    # Overridden callbacks
+    RESPONSE_CALLBACKS = dict_merge(
+        StrictRedis.RESPONSE_CALLBACKS,
+        {
+            'TTL': lambda r: r >= 0 and r or None,
+            'PTTL': lambda r: r >= 0 and r or None,
+        }
+    )
+
+    def pipeline(self, transaction=True, shard_hint=None):
+        """
+        Return a new pipeline object that can queue multiple commands for
+        later execution. ``transaction`` indicates whether all commands
+        should be executed atomically. Apart from making a group of operations
+        atomic, pipelines are useful for reducing the back-and-forth overhead
+        between the client and server.
+        """
+        if shard_hint:
+            raise RedisClusterException("shard_hint is deprecated in cluster mode")
+
+        if transaction:
+            raise RedisClusterException("transaction is deprecated in cluster mode")
+
+        return StrictClusterPipeline(
+            connection_pool=self.connection_pool,
+            startup_nodes=self.connection_pool.nodes.startup_nodes,
+            response_callbacks=self.response_callbacks
+        )
+
+    def setex(self, name, value, time):
+        """
+        Set the value of key ``name`` to ``value`` that expires in ``time``
+        seconds. ``time`` can be represented by an integer or a Python
+        timedelta object.
+        """
+        if isinstance(time, datetime.timedelta):
+            time = time.seconds + time.days * 24 * 3600
+
+        return self.execute_command('SETEX', name, time, value)
+
+    def lrem(self, name, value, num=0):
+        """
+        Remove the first ``num`` occurrences of elements equal to ``value``
+        from the list stored at ``name``.
+        The ``num`` argument influences the operation in the following ways:
+            num > 0: Remove elements equal to value moving from head to tail.
+            num < 0: Remove elements equal to value moving from tail to head.
+            num = 0: Remove all elements equal to value.
+        """
+        return self.execute_command('LREM', name, num, value)
+
+    def zadd(self, name, *args, **kwargs):
+        """
+        NOTE: The order of arguments differs from that of the official ZADD
+        command. For backwards compatability, this method accepts arguments
+        in the form of name1, score1, name2, score2, while the official Redis
+        documents expects score1, name1, score2, name2.
+        If you're looking to use the standard syntax, consider using the
+        StrictRedis class. See the API Reference section of the docs for more
+        information.
+        Set any number of element-name, score pairs to the key ``name``. Pairs
+        can be specified in two ways:
+        As *args, in the form of: name1, score1, name2, score2, ...
+        or as **kwargs, in the form of: name1=score1, name2=score2, ...
+        The following example would add four values to the 'my-key' key:
+        redis.zadd('my-key', 'name1', 1.1, 'name2', 2.2, name3=3.3, name4=4.4)
+        """
+        pieces = []
+
+        if args:
+            if len(args) % 2 != 0:
+                raise RedisError("ZADD requires an equal number of values and scores")
+            pieces.extend(reversed(args))
+
+        for pair in iteritems(kwargs):
+            pieces.append(pair[1])
+            pieces.append(pair[0])
+
+        return self.execute_command('ZADD', name, *pieces)
+
+from rediscluster.pipeline import StrictClusterPipeline
