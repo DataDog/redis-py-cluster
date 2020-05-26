@@ -19,6 +19,11 @@ from redis.exceptions import ResponseError
 basepath = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(1, basepath)
 
+# redis 6 release candidates report a version number of 5.9.x. Use this
+# constant for skip_if decorators as a placeholder until 6.0.0 is officially
+# released
+REDIS_6_VERSION = '5.9.0'
+
 _REDIS_VERSIONS = {}
 REDIS_INFO = {}
 
@@ -264,3 +269,22 @@ def skip_unless_arch_bits(arch_bits):
         REDIS_INFO["arch_bits"] != arch_bits,
         reason="server is not {}-bit".format(arch_bits),
     )
+
+
+def wait_for_command(client, monitor, command):
+    # issue a command with a key name that's local to this process.
+    # if we find a command with our key before the command we're waiting
+    # for, something went wrong
+    redis_version = REDIS_INFO["version"]
+    if StrictVersion(redis_version) >= StrictVersion('5.0.0'):
+        id_str = str(client.client_id())
+    else:
+        id_str = '%08x' % random.randrange(2**32)
+    key = '__REDIS-PY-%s__' % id_str
+    client.get(key)
+    while True:
+        monitor_response = monitor.next_command()
+        if command in monitor_response['command']:
+            return monitor_response
+        if key in monitor_response['command']:
+            return None

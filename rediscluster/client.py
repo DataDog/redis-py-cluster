@@ -21,6 +21,7 @@ from .exceptions import (
     ClusterError,
     MovedError,
     RedisClusterException,
+    SlotNotCoveredError,
     TryAgainError,
 )
 from .pubsub import ClusterPubSub
@@ -99,7 +100,6 @@ class RedisCluster(Redis):
             'ACL USERS',
             'ACL WHOAMI',
             'BITOP',
-            'CLIENT SETNAME',
             'MOVE',
             'SCRIPT KILL',
             'SENTINEL GET-MASTER-ADDR-BY-NAME',
@@ -120,6 +120,7 @@ class RedisCluster(Redis):
             "CLIENT ID",
             "CLIENT KILL",
             "CLIENT LIST",
+            "CLIENT SETNAME",
             "CLUSTER INFO",
             "CONFIG GET",
             "CONFIG RESETSTAT",
@@ -211,6 +212,7 @@ class RedisCluster(Redis):
             "CLIENT ID",
             "CLIENT KILL",
             "CLIENT LIST",
+            "CLIENT SETNAME",
             "CLUSTER INFO",
             "CONFIG GET",
             "CONFIG RESETSTAT",
@@ -290,7 +292,7 @@ class RedisCluster(Redis):
 
     def __init__(self, host=None, port=None, startup_nodes=None, max_connections=None, max_connections_per_node=False, init_slot_cache=True,
                  readonly_mode=False, reinitialize_steps=None, skip_full_coverage_check=False, nodemanager_follow_cluster=False,
-                 connection_class=None, read_from_replicas=False, cluster_down_retry_attempts=3,
+                 connection_class=None, read_from_replicas=False, cluster_down_retry_attempts=3, host_port_remap=None,
                  request_ttl=16, conn_err_sleep_time=0.1, **kwargs):
         """
         :startup_nodes:
@@ -353,6 +355,7 @@ class RedisCluster(Redis):
                 skip_full_coverage_check=skip_full_coverage_check,
                 nodemanager_follow_cluster=nodemanager_follow_cluster,
                 connection_class=connection_class,
+                host_port_remap=host_port_remap,
                 **kwargs
             )
 
@@ -469,8 +472,8 @@ class RedisCluster(Redis):
             return slots.pop()
 
         if command in ['XREADGROUP', 'XREAD']:
-            tokens = {args[i].value: i for i in range(len(args)) if type(args[i]) == Token}
-            keys_ids = list(args[tokens['STREAMS'] + 1: ])
+            stream_idx = args.index(b'STREAMS')
+            keys_ids = list(args[stream_idx + 1: ])
             idx_split = len(keys_ids) // 2
             keys = keys_ids[: idx_split]
             slots = {self.connection_pool.nodes.keyslot(key) for key in keys}
@@ -571,9 +574,9 @@ class RedisCluster(Redis):
 
             if asking:
                 node = self.connection_pool.nodes.nodes[redirect_addr]
-                r = self.connection_pool.get_connection_by_node(node)
+                connection = self.connection_pool.get_connection_by_node(node)
             elif try_random_node:
-                r = self.connection_pool.get_random_connection()
+                connection = self.connection_pool.get_random_connection()
                 try_random_node = False
             else:
                 if self.refresh_table_asap:
@@ -584,26 +587,36 @@ class RedisCluster(Redis):
                 else:
                     node = self.connection_pool.get_node_by_slot(slot, self.read_from_replicas and (command in self.READ_COMMANDS))
                     is_read_replica = node['server_type'] == 'slave'
-                r = self.connection_pool.get_connection_by_node(node)
+                connection = self.connection_pool.get_connection_by_node(node)
 
             try:
                 if asking:
-                    r.send_command('ASKING')
-                    self.parse_response(r, "ASKING", **kwargs)
+                    connection.send_command('ASKING')
+                    self.parse_response(connection, "ASKING", **kwargs)
                     asking = False
                 if is_read_replica:
                     # Ask read replica to accept reads (see https://redis.io/commands/readonly)
                     # TODO: do we need to handle errors from this response?
-                    r.send_command('READONLY')
-                    self.parse_response(r, 'READONLY', **kwargs)
+                    connection.send_command('READONLY')
+                    self.parse_response(connection, 'READONLY', **kwargs)
                     is_read_replica = False
 
-                r.send_command(*args)
-                return self.parse_response(r, command, **kwargs)
+                connection.send_command(*args)
+                return self.parse_response(connection, command, **kwargs)
+            except SlotNotCoveredError as e:
+                # In some cases during failover to a replica is happening
+                # a slot sometimes is not covered by the cluster layout and
+                # we need to attempt to refresh the cluster layout and try again
+                self.refresh_table_asap = True
+                time.sleep(0.05)
+
+                # This is the last attempt before we run out of TTL, raise the exception
+                if ttl == 1:
+                    raise e
             except (RedisClusterException, BusyLoadingError):
                 raise
             except ConnectionError:
-                r.disconnect()
+                connection.disconnect()
             except TimeoutError:
                 if ttl < (self.request_ttl or self.RedisClusterRequestTTL) / 2:
                     time.sleep(self.conn_err_sleep_time)
@@ -631,7 +644,7 @@ class RedisCluster(Redis):
             except AskError as e:
                 redirect_addr, asking = "{0}:{1}".format(e.host, e.port), True
             finally:
-                self.connection_pool.release(r)
+                self.connection_pool.release(connection)
 
         raise ClusterError('TTL exhausted.')
 
@@ -730,7 +743,7 @@ class RedisCluster(Redis):
         Sends to specefied node
         """
         assert option.upper() in ('FORCE', 'TAKEOVER')  # TODO: change this option handling
-        return self.execute_command('CLUSTER FAILOVER', option)
+        return self.execute_command('CLUSTER FAILOVER', option, node_id=node_id)
 
     def cluster_info(self):
         """
