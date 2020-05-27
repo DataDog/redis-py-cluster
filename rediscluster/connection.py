@@ -71,6 +71,7 @@ class SSLClusterConnection(SSLConnection):
     def __init__(self, **kwargs):
         self.readonly = kwargs.pop('readonly', False)
         kwargs['parser_class'] = ClusterParser
+        kwargs.pop('ssl', False)
         super(SSLClusterConnection, self).__init__(**kwargs)
 
     def on_connect(self):
